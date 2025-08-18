@@ -17,6 +17,9 @@ This README documents a Bash script that **builds and installs Node.js v22.18.0 
 
 ---
 
+NOTE!!! This is very memory intensive, so to make sure your server doesn't crash, I've slowed the process WAY down.  This will take a few hours to run more than likely.  Enjoy!
+
+
 ## What the script does (detailed)
 
 1) Validates environment  
