@@ -1,173 +1,179 @@
 #!/usr/bin/env bash
-# Build & install Node.js v22.18.0 on EL7/cPanel with ultra-low-memory settings.
-# - Forces MAKE_JOBS=1
-# - Adds swap (default 16G) if none is active
-# - Uses -O1 -g0 (override with CXXFLAGS_OLEVEL=0 to use -O0)
-# - Patches bundled c-ares to avoid sys/random.h/getrandom on EL7
-# - Uses devtoolset-11 + rh-python38
-# - Installs to /opt/node-v22.18.0 and exposes via /etc/profile.d
+# Node.js v22.18.0 builder for CentOS/RHEL 7 (cPanel-safe)
+# Faster build, fully logged, EL7 c-ares patch, SCL toolchain.
 
 set -euo pipefail
 
-# ---------- Tunables ----------
-NODE_VER="${NODE_VER:-22.18.0}"
-PREFIX="${PREFIX:-/opt/node-v${NODE_VER}}"
-SRC_DIR="${SRC_DIR:-/usr/local/src}"
-SWAPFILE="${SWAPFILE:-/swapfile}"
-SWAP_SIZE_GB="${SWAP_SIZE_GB:-16}"        # Increase if you still OOM
-MAKE_JOBS="1"                              # Force serial compile (best for RAM)
-CXXFLAGS_OLEVEL="${CXXFLAGS_OLEVEL:-1}"    # 1 => -O1 (default), 0 => -O0
-# ------------------------------
+NODE_VER="v22.18.0"
+NODE_DIR="node-${NODE_VER}"
+NODE_TGZ="${NODE_DIR}.tar.gz"
+NODE_URL="https://nodejs.org/dist/${NODE_VER}/${NODE_TGZ}"
 
-TARBALL="node-v${NODE_VER}.tar.xz"
-TARBALL_URL="https://nodejs.org/dist/v${NODE_VER}/${TARBALL}"
-BUILD_DIR="${SRC_DIR}/node-v${NODE_VER}"
+SRC_ROOT="/usr/local/src"
+PREFIX="/opt/${NODE_DIR}"
+LOG="/root/node_${NODE_VER}_build.log"
 
-log(){ printf "[%s] %s\n" "$(date +'%F %T')" "$*"; }
+# ---- Tunables (override via env when calling) ----
+: "${MAKE_JOBS:=auto}"      # "auto" or a number; try 2–3 for speed if you have RAM
+: "${SWAP_GB:=0}"           # 0 = no temp swap; set 4 or 8 if RAM is tight
+: "${VERBOSE:=0}"           # 1 = very chatty build logs (V=1 + shell tracing)
 
-require_root(){
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then echo "Run as root."; exit 1; fi
-}
+# Compile flags aimed at faster compile time (lower CPU/RAM)
+CFLAGS_BASE="-O0 -g0 -pipe"
+CXXFLAGS_BASE="-O0 -g0 -pipe"
 
-detect_el7(){
-  if [[ -f /etc/redhat-release ]] && grep -qE 'release 7(\.|$)' /etc/redhat-release; then
-    return 0
-  fi
-  echo "This script targets RHEL/CentOS/CloudLinux 7."; exit 1
-}
+# --------------------------------------------------
+say()  { printf "\n[%(%F %T)T] %s\n" -1 "$*"; }
+die()  { say "ERROR: $*"; exit 1; }
 
-ensure_swap(){
-  if swapon --show | awk 'NR>1 || (NR==1 && $1!~/^$|^Filename$/)' | grep -q .; then
-    log "Swap already active:"
-    swapon --show || true
-    return
-  fi
+require_root() { [[ $EUID -eq 0 ]] || die "Run as root."; }
+require_root
 
-  log "No swap detected. Creating ${SWAP_SIZE_GB}G swap at ${SWAPFILE}…"
-  fallocate -l "${SWAP_SIZE_GB}G" "${SWAPFILE}" 2>/dev/null || \
-    dd if=/dev/zero of="${SWAPFILE}" bs=1M count=$((SWAP_SIZE_GB*1024))
-  chmod 600 "${SWAPFILE}"
-  mkswap "${SWAPFILE}"
-  swapon "${SWAPFILE}"
-  grep -q "${SWAPFILE}" /etc/fstab || echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
-  sysctl -w vm.swappiness=10 >/dev/null || true
-  log "Swap ready:"
-  swapon --show || true
-}
+# Start log early and mirror to console
+exec > >(stdbuf -oL -eL awk '{ print strftime("[%F %T]"), $0 }' | tee -a "${LOG}") \
+     2> >(stdbuf -oL -eL awk '{ print strftime("[%F %T]"), $0 }' | tee -a "${LOG}" >&2)
+say "Node ${NODE_VER} build starting. Log: ${LOG}"
 
-install_prereqs(){
-  log "Installing prerequisites…"
-  yum -y install curl tar xz make perl gcc gcc-c++ python3 || true
-  yum -y install centos-release-scl || true
-  yum -y install devtoolset-11 rh-python38 || true
-}
+# Simple phase timer
+phase_start() { PHASE_NAME="$1"; PHASE_T0=$(date +%s); say "==> ${PHASE_NAME} START"; }
+phase_end()   { local t1=$(date +%s); say "==> ${PHASE_NAME} DONE in $((t1-PHASE_T0))s"; }
 
-enable_toolchains(){
-  # Enable SCL envs
-  [[ -f /opt/rh/devtoolset-11/enable ]] && source /opt/rh/devtoolset-11/enable
-  [[ -f /opt/rh/rh-python38/enable   ]] && source /opt/rh/rh-python38/enable
+# Detect EL version (informational)
+ELREL="$(grep -Eo 'release [0-9]+' /etc/*release 2>/dev/null | head -n1 | awk '{print $2}')"
+say "Detected EL release: ${ELREL:-unknown} (OK if unknown)"
 
-  # Pin Python for gyp
-  if [[ -x /opt/rh/rh-python38/root/usr/bin/python3 ]]; then
-    export PYTHON=/opt/rh/rh-python38/root/usr/bin/python3
-  elif command -v python3 >/dev/null 2>&1; then
-    export PYTHON="$(command -v python3)"
-  else
-    echo "Python 3 not found; install rh-python38 or python3."; exit 1
-  fi
-  export GYP_PYTHON="$PYTHON"
+# Dependencies
+phase_start "Install deps (SCL toolchain, Python 3.8, build tools)"
+yum -y install -q epel-release || true
+yum -y install -q curl tar xz bzip2 make gcc gcc-c++ git perl || true
+yum -y install -q centos-release-scl scl-utils || true
+yum -y install -q devtoolset-11 devtoolset-11-gcc devtoolset-11-gcc-c++ devtoolset-11-binutils || true
+yum -y install -q rh-python38 rh-python38-python-devel || true
+phase_end
 
-  log "Toolchains:"
-  gcc --version | head -n1 || true
-  "$PYTHON" --version || true
-}
-
-prepare_sources(){
-  mkdir -p "$SRC_DIR"
-  cd "$SRC_DIR"
-
-  if [[ ! -f "$TARBALL" ]]; then
-    log "Downloading Node.js v${NODE_VER} source…"
-    curl -fsSLO "$TARBALL_URL"
-  else
-    log "Found source tarball: $TARBALL"
-  fi
-
-  if [[ ! -d "$BUILD_DIR" ]]; then
-    log "Extracting ${TARBALL}…"
-    tar -xf "$TARBALL"
-  else
-    log "Reusing existing source dir: $BUILD_DIR"
+# Optional temp swap
+add_swap() {
+  local sz_gb="$1"
+  [[ "${sz_gb}" -gt 0 ]] || return 0
+  if [[ ! -f /swapfile_node22 ]]; then
+    say "Adding temporary ${sz_gb}G swapfile to reduce OOM risk during V8 build"
+    fallocate -l "${sz_gb}G" /swapfile_node22 || dd if=/dev/zero of=/swapfile_node22 bs=1M count=$((sz_gb*1024))
+    chmod 600 /swapfile_node22
+    mkswap /swapfile_node22
+    swapon /swapfile_node22
+    say "Swap enabled at /swapfile_node22"
   fi
 }
+add_swap "${SWAP_GB}"
 
-patch_cares_el7(){
-  local cfg="${BUILD_DIR}/deps/cares/config/linux/ares_config.h"
-  if [[ -f "$cfg" ]]; then
-    log "Patching c-ares config for EL7 (disable sys/random.h & getrandom)…"
-    sed -ri 's/^[[:space:]]*#define[[:space:]]+HAVE_SYS_RANDOM_H\b.*/#undef HAVE_SYS_RANDOM_H/' "$cfg" || true
-    sed -ri 's/^[[:space:]]*#define[[:space:]]+HAVE_GETRANDOM\b.*/#undef HAVE_GETRANDOM/' "$cfg" || true
-    grep -nE 'HAVE_(SYS_RANDOM_H|GETRANDOM)' "$cfg" || true
-  else
-    log "WARNING: ${cfg} not found; continuing."
-  fi
+# Choose parallelism
+auto_jobs() {
+  local cpu mem_kb swap_kb mem_gb total_gb per_job_mb=1700
+  cpu=$(nproc 2>/dev/null || echo 1)
+  mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+  swap_kb=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+  mem_gb=$(( (mem_kb + 1023) / 1024 / 1024 ))
+  total_gb=$(( (mem_kb + swap_kb + 1023) / 1024 / 1024 ))
+  # Conservative heuristic: ~1.7GB per job
+  local max_by_mem=$(( ( (mem_kb + swap_kb) / 1024 ) / per_job_mb ))
+  (( max_by_mem < 1 )) && max_by_mem=1
+  local jobs=$(( cpu < max_by_mem ? cpu : max_by_mem ))
+  (( jobs > 3 )) && jobs=3         # cap for EL7 boxes
+  (( jobs < 1 )) && jobs=1
+  echo "${jobs}"
 }
 
-configure_build(){
-  cd "$BUILD_DIR"
+if [[ "${MAKE_JOBS}" == "auto" ]]; then
+  MAKE_JOBS="$(auto_jobs)"
+fi
+say "Using MAKE_JOBS=${MAKE_JOBS}  (override: MAKE_JOBS=N)"; sleep 1
 
-  # Ultra-low-memory C/C++ flags
-  case "$CXXFLAGS_OLEVEL" in
-    0) OLEVEL="-O0" ;;
-    1) OLEVEL="-O1" ;;
-    *) OLEVEL="-O1" ;;
-  esac
+# Download & unpack
+phase_start "Fetch Node ${NODE_VER} source"
+mkdir -p "${SRC_ROOT}"
+cd "${SRC_ROOT}"
+[[ -f "${NODE_TGZ}" ]] || curl -fL "${NODE_URL}" -o "${NODE_TGZ}"
+rm -rf "${NODE_DIR}" && tar -xzf "${NODE_TGZ}"
+phase_end
 
-  export CFLAGS="${CFLAGS:-} ${OLEVEL} -g0"
-  export CXXFLAGS="${CXXFLAGS:-} ${OLEVEL} -g0"
-  # Avoid pipes (they can increase peak RAM usage in some environments)
-  export CFLAGS="${CFLAGS} -fno-asynchronous-unwind-tables"
-  export CXXFLAGS="${CXXFLAGS} -fno-asynchronous-unwind-tables"
+# Patch c-ares (EL7 lacks sys/random.h & getrandom)
+phase_start "Patch c-ares for EL7 (disable sys/random.h/getrandom)"
+cd "${SRC_ROOT}/${NODE_DIR}"
+ARES_CFG="deps/cares/config/linux/ares_config.h"
+if [[ -f "${ARES_CFG}" ]]; then
+  sed -ri 's/^(#\s*define\s+HAVE_SYS_RANDOM_H\b.*)$/#undef HAVE_SYS_RANDOM_H/' "${ARES_CFG}" || true
+  sed -ri 's/^(#\s*define\s+HAVE_GETRANDOM\b.*)$/#undef HAVE_GETRANDOM/' "${ARES_CFG}" || true
+  grep -q 'HAVE_SYS_RANDOM_H' "${ARES_CFG}" || echo '#undef HAVE_SYS_RANDOM_H' >> "${ARES_CFG}"
+  grep -q 'HAVE_GETRANDOM'    "${ARES_CFG}" || echo '#undef HAVE_GETRANDOM'    >> "${ARES_CFG}"
+else
+  say "[!] ${ARES_CFG} not found — will inject -U defines during build."
+fi
+phase_end
 
-  log "Configuring (prefix: ${PREFIX}) with Python: ${PYTHON} and CXXFLAGS: ${CXXFLAGS}"
-  PYTHON="${PYTHON}" ./configure --prefix="${PREFIX}"
+# Build inside SCL env
+build() {
+  local cflags="$1" cxxflags="$2" jobs="$3" verbose="$4"
+
+  export CC=gcc CXX=g++
+  export CFLAGS="${cflags} -fno-omit-frame-pointer -fno-strict-aliasing -U_FORTIFY_SOURCE -UHAVE_SYS_RANDOM_H -UHAVE_GETRANDOM"
+  export CXXFLAGS="${cxxflags} -fno-rtti -fno-exceptions -fno-omit-frame-pointer -fno-strict-aliasing -U_FORTIFY_SOURCE -UHAVE_SYS_RANDOM_H -UHAVE_GETRANDOM"
+  export LDFLAGS="${LDFLAGS:-} -Wl,--no-as-needed"
+  export ARFLAGS="cr"
+
+  # Python for GYP
+  PYBIN="/opt/rh/rh-python38/root/usr/bin/python3"
+  [[ -x "${PYBIN}" ]] || PYBIN="$(command -v python3 || true)"
+  [[ -x "${PYBIN}" ]] || die "python3 not found"
+  export PYTHON="${PYBIN}"
+  say "Using Python: ${PYTHON}"
+
+  say "Running configure (intl=none, prefix=${PREFIX})"
+  make -s distclean >/dev/null 2>&1 || true
+  time ./configure --prefix="${PREFIX}" --with-intl=none
+
+  say "Building Node (jobs=${jobs}, verbose=${verbose}) — this phase is the long one"
+  local VFLAG="V=0"; [[ "${verbose}" == "1" ]] && VFLAG="V=1"
+  # GNU make on EL7 is 3.82 (no --output-sync). We still stream logs live.
+  time make -j"${jobs}" ${VFLAG}
+  say "Installing to ${PREFIX}"
+  time make install
 }
 
-build_and_install(){
-  cd "$BUILD_DIR"
-  log "Building Node.js with MAKE_JOBS=${MAKE_JOBS} (this will be slow, but safe on RAM)…"
-  make -j"${MAKE_JOBS}"
+phase_start "Compile & install"
+BUILD_VERBOSE="${VERBOSE}"
 
-  log "Installing to ${PREFIX}…"
-  make install
+if command -v scl >/dev/null 2>&1 && scl -l | grep -q devtoolset-11; then
+  # Run the whole build inside SCL bash
+  scl enable devtoolset-11 rh-python38 -- bash -lc "
+    set -euo pipefail
+    cd '${SRC_ROOT}/${NODE_DIR}'
+    $(declare -f say die build)
+    build '${CFLAGS_BASE}' '${CXXFLAGS_BASE}' '${MAKE_JOBS}' '${BUILD_VERBOSE}'
+  "
+else
+  say "[!] SCL not detected; building with system toolchain"
+  build "${CFLAGS_BASE}" "${CXXFLAGS_BASE}" "${MAKE_JOBS}" "${BUILD_VERBOSE}"
+fi
+phase_end
 
-  ln -snf "${PREFIX}/bin/node" /usr/local/bin/node
-  ln -snf "${PREFIX}/bin/npm"  /usr/local/bin/npm
-  ln -snf "${PREFIX}/bin/npx"  /usr/local/bin/npx
+# Symlinks
+phase_start "Create symlinks"
+ln -sf "${PREFIX}/bin/node" /usr/local/bin/node
+ln -sf "${PREFIX}/bin/npm"  /usr/local/bin/npm
+ln -sf "${PREFIX}/bin/npx"  /usr/local/bin/npx
+phase_end
 
-  cat >/etc/profile.d/node22.sh <<EOF
-# Node.js v${NODE_VER}
-export PATH="${PREFIX}/bin:\$PATH"
-EOF
-  chmod 644 /etc/profile.d/node22.sh
+# Verify
+phase_start "Verify installation"
+node -v
+npm -v || true
+phase_end
 
-  log "Installed:"
-  "${PREFIX}/bin/node" -v
-  "${PREFIX}/bin/npm" -v
-}
+say "SUCCESS: Node ${NODE_VER} installed at ${PREFIX}"
+say "Binary symlinks -> /usr/local/bin/{node,npm,npx}"
+say "Full build log at: ${LOG}"
 
-main(){
-  require_root
-  detect_el7
-  ensure_swap
-  install_prereqs
-  enable_toolchains
-  prepare_sources
-  patch_cares_el7
-  configure_build
-  build_and_install
-  log "Done. New shells will pick up PATH from /etc/profile.d/node22.sh"
-  log "If you still hit OOM, rerun with: CXXFLAGS_OLEVEL=0 bash $0"
-}
-
-main "$@"
+if [[ -f /swapfile_node22 ]]; then
+  say "Temporary swapfile /swapfile_node22 is still enabled."
+  echo "To remove later:  swapoff /swapfile_node22 && rm -f /swapfile_node22"
+fi
