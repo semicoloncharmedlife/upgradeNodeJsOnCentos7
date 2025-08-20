@@ -87,6 +87,20 @@ You can change `NODE_PREFIX` if you prefer a different install path (e.g., `/usr
 
 ## Usage
 
+```
+# save it
+vi /root/install-node22.sh
+# paste the script below, save & quit
+
+chmod +x /root/install-node22.sh
+
+# optional: add temporary swap & pick parallel jobs
+SWAP_GB=6 MAKE_JOBS=3 /root/install-node22.sh
+
+# watch live
+tail -f /root/node_v22.18.0_build.log
+```
+
 Prereqs: run as root on CentOS 7 x86_64 with network access.
 
 1) Save the installer script (for example as `/root/install-node22.sh`) and make it executable  
